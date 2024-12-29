@@ -12,9 +12,9 @@ from typing import List, Optional
 from abc import ABC, abstractmethod
 import torch.nn as nn
 
-from scheduler import OneCycleLRWithWarmup
+from xnguyen.scheduler import OneCycleLRWithWarmup
 import torch.distributed as dist
-from utils import MetricLogger
+from xnguyen.utils import MetricLogger
 
 
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -41,7 +41,7 @@ class AcceleratorTrainer:
         deepspeed_plugin = DeepSpeedPlugin(zero_stage=2, gradient_clipping=1.0)
         accelerator = Accelerator(
             split_batches=False,
-            mixed_precision="no",
+            mixed_precision="fp16" if self.args.use_fp16 else "no",
             deepspeed_plugin=deepspeed_plugin,
         )
         accelerator.print("PID of this process =", os.getpid())
@@ -146,14 +146,21 @@ class AcceleratorTrainer:
         return scheduler
 
     def valid_one_epoch(self, epoch):
-        if self.valid_loader:
+        if self.valid_loader and (epoch + 1) % self.args.eval_interval == 0:
             valid_stats = self.run_one_epoch(self.valid_loader, epoch, is_train=False)
         else:
             valid_stats = None
 
         return valid_stats
 
+    def train_one_epoch(self, epoch):
+        train_stats = self.run_one_epoch(self.train_loader, epoch, is_train=True)
+        return train_stats
+
     def is_best(self, stats):
+        if stats is None:
+            return False
+
         current_score = stats["loss"]
         is_best = False
         if current_score < self.best_score:
@@ -193,18 +200,24 @@ class AcceleratorTrainer:
             self.save_ckpt(f"best", epoch)
 
     def save_log(self, train_stats, valid_stats, epoch):
+        def write_log(log_stats):
+            if self.accelerator.is_main_process:
+                with (Path(self.args.output_dir) / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+
         log_train_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
             "epoch": epoch,
         }
-        log_valid_stats = {
-            **{f"valid_{k}": v for k, v in valid_stats.items()},
-            "epoch": epoch,
-        }
-        if self.accelerator.is_main_process:
-            with (Path(self.args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_train_stats) + "\n")
-                f.write(json.dumps(log_valid_stats) + "\n")
+
+        write_log(log_train_stats)
+
+        if valid_stats is not None:
+            log_valid_stats = {
+                **{f"valid_{k}": v for k, v in valid_stats.items()},
+                "epoch": epoch,
+            }
+            write_log(log_valid_stats)
 
     def restart_from_checkpoint(self, ckp_path, run_variables=None, **kwargs):
         """
@@ -267,16 +280,16 @@ class AcceleratorTrainer:
 
         print(f"[+] Start training !")
         for epoch in range(start_epoch, self.args.epochs):
-            train_stats = self.run_one_epoch(self.train_loader, epoch, is_train=True)
-            if self.valid_loader:
-                valid_stats = self.run_one_epoch(
-                    self.valid_loader, epoch, is_train=False
-                )
-            else:
-                valid_stats = None
+            train_stats = self.train_one_epoch(epoch)
+            valid_stats = self.valid_one_epoch(epoch)
 
             if valid_stats is None:
                 valid_stats = train_stats
+                stats = train_stats
+            else:
+                stats = valid_stats
+
+            if self.valid_loader is None:  # No valid steps
                 stats = train_stats
             else:
                 stats = valid_stats
