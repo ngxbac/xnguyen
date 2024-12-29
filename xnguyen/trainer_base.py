@@ -31,18 +31,30 @@ class AcceleratorTrainer:
         self.optimizer = self.get_optimizer()
         self.scheduler = self.get_scheduler()
         self.criterion = self.get_criterion()
-        self.best_score = np.inf
 
         self.prepare_multi_gpu()
 
+        self.setup_metric_comparision(score_key="loss", compare_fn="decrease")
+
         Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    def setup_metric_comparision(self, score_key, compare_fn="increase"):
+        assert compare_fn in ["increase", "decrease"]
+        if compare_fn == "increase":
+            self.best_score = -np.inf
+            self.compare_fn = lambda x1, x2: x1 > x2
+        else:
+            self.best_score = np.inf
+            self.compare_fn = lambda x1, x2: x1 < x2
+
+        self.score_key = score_key
 
     def init_accelerator(self):
         deepspeed_plugin = DeepSpeedPlugin(zero_stage=2, gradient_clipping=1.0)
         accelerator = Accelerator(
             split_batches=False,
             mixed_precision="fp16" if self.args.use_fp16 else "no",
-            deepspeed_plugin=deepspeed_plugin,
+            deepspeed_plugin=deepspeed_plugin if self.args.deepspeed else None,
         )
         accelerator.print("PID of this process =", os.getpid())
         device = accelerator.device
@@ -148,6 +160,7 @@ class AcceleratorTrainer:
     def valid_one_epoch(self, epoch):
         if self.valid_loader and (epoch + 1) % self.args.eval_interval == 0:
             valid_stats = self.run_one_epoch(self.valid_loader, epoch, is_train=False)
+            valid_stats[f"best_{self.score_key}"] = self.best_score
         else:
             valid_stats = None
 
@@ -161,9 +174,9 @@ class AcceleratorTrainer:
         if stats is None:
             return False
 
-        current_score = stats["loss"]
+        current_score = stats[self.score_key]
         is_best = False
-        if current_score < self.best_score:
+        if self.compare_fn(current_score, self.best_score):
             self.best_score = current_score
             is_best = True
 
@@ -172,10 +185,7 @@ class AcceleratorTrainer:
     def save_ckpt(self, tag, epoch):
         if self.accelerator.is_main_process:
             ckpt_path = self.args.output_dir + f"/{tag}.pth"
-            print(f"--- saving model: {ckpt_path} ---", flush=True)
             unwrapped_model = self.accelerator.unwrap_model(self.model)
-            # unwarpped_optimizer = self.accelerator.unwrap_model(self.optimizer)
-            # print("unwarpped optimizer keys", unwarpped_optimizer.state_dict().keys())
 
             try:
                 torch.save(
@@ -191,7 +201,6 @@ class AcceleratorTrainer:
             del unwrapped_model
 
         state_path = os.path.join(self.args.output_dir, tag)
-        print(f"--- saving state: {state_path} ---", flush=True)
         self.accelerator.save_state(state_path)
 
     def save(self, epoch, is_best):
@@ -265,7 +274,7 @@ class AcceleratorTrainer:
 
     def train(self):
         start_time = time.time()
-        to_restore = {"epoch": 0, "best_score": np.inf}
+        to_restore = {"epoch": 0, "best_score": self.best_score}
         if os.path.isfile(self.args.resume):
             self.restart_from_checkpoint(
                 self.args.resume,
@@ -313,7 +322,11 @@ class AcceleratorTrainer:
         return loss
 
     def pre_forward(self, batch):
-        pass
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = batch[k].cuda()
+
+        return batch
 
     def pos_forward(self, loss, is_train=True):
         if not math.isfinite(loss.item()):
@@ -326,6 +339,7 @@ class AcceleratorTrainer:
         self.accelerator.backward(loss)
         self.optimizer.step()
         self.scheduler.step()
+        self.optimizer.zero_grad()
 
     def run_one_epoch(self, data_loader, epoch, is_train):
         self.epoch = epoch
@@ -340,7 +354,8 @@ class AcceleratorTrainer:
         header = "Epoch: [{}/{}]".format(epoch, self.args.epochs)
 
         for batch in metric_logger.log_every(data_loader, 10, header):
-            self.optimizer.zero_grad()
+            # if is_train:
+            # self.optimizer.zero_grad()
             batch = self.pre_forward(batch)
             output_dict = self.model_forward(batch=batch, is_train=is_train)
             ret_dict = self.criterion(output_dict, batch)

@@ -15,7 +15,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--use_fp16",
-    action=argparse.BooleanOptionalAction,
+    # action=argparse.BooleanOptionalAction,
+    action="store_true",
     default=False,
     help="""Whether or not
     to use half precision for training""",
@@ -55,8 +56,15 @@ parser.add_argument(
 )
 parser.add_argument(
     "--distributed",
-    default=True,
-    action=argparse.BooleanOptionalAction,
+    # default=True,
+    # action=argparse.BooleanOptionalAction,
+    action="store_true",
+)
+parser.add_argument(
+    "--deepspeed",
+    # default=True,
+    # action=argparse.BooleanOptionalAction,
+    action="store_true",
 )
 parser.add_argument(
     "--dist_url",
