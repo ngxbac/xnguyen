@@ -50,9 +50,14 @@ class AcceleratorTrainer:
         self.score_key = score_key
 
     def init_accelerator(self):
+        from accelerate import Accelerator
+        from accelerate.utils import DistributedDataParallelKwargs
+
+        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         deepspeed_plugin = DeepSpeedPlugin(zero_stage=2, gradient_clipping=1.0)
         accelerator = Accelerator(
             split_batches=False,
+            kwargs_handlers=[kwargs],
             mixed_precision="fp16" if self.args.use_fp16 else "no",
             deepspeed_plugin=deepspeed_plugin if self.args.deepspeed else None,
         )
