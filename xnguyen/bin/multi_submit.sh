@@ -159,7 +159,7 @@ full_command="sbatch \
     --partition ${cluster} \
     --time ${TIME} ${OPT} \
     --dependency=afterany:538724 \
-    ./bin/srun_buffer.sh ${script} ${NNODES} ${host} ${offset}"
+    srun_buffer.sh ${script} ${NNODES} ${host} ${offset}"
 
 echo -e "Running Command: " ${Green} ${full_command} ${Color_Off}
 
