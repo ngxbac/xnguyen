@@ -344,7 +344,7 @@ class AcceleratorTrainer:
         self.accelerator.backward(loss)
         self.optimizer.step()
         self.scheduler.step()
-        self.optimizer.zero_grad()
+        # self.optimizer.zero_grad()
 
     def run_one_epoch(self, data_loader, epoch, is_train):
         self.epoch = epoch
@@ -359,8 +359,8 @@ class AcceleratorTrainer:
         header = "Epoch: [{}/{}]".format(epoch, self.args.epochs)
 
         for batch in metric_logger.log_every(data_loader, 10, header):
-            # if is_train:
-            # self.optimizer.zero_grad()
+            if is_train:
+                self.optimizer.zero_grad()
             batch = self.pre_forward(batch)
             output_dict = self.model_forward(batch=batch, is_train=is_train)
             ret_dict = self.criterion(output_dict, batch)
