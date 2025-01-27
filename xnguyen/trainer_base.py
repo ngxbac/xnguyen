@@ -173,7 +173,7 @@ class AcceleratorTrainer:
 
     def train_one_epoch(self, epoch):
         if self.args.distributed:
-            self.train_loader.sampler.set_epoch(epoch)
+            self.train_loader.set_epoch(epoch)
         train_stats = self.run_one_epoch(self.train_loader, epoch, is_train=True)
         return train_stats
 
