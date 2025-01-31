@@ -165,7 +165,7 @@ class AcceleratorTrainer:
     def valid_one_epoch(self, epoch):
         if self.valid_loader and (epoch + 1) % self.args.eval_interval == 0:
             valid_stats = self.run_one_epoch(self.valid_loader, epoch, is_train=False)
-            valid_stats[f"best_{self.score_key}"] = self.best_score
+            # valid_stats[f"best_{self.score_key}"] = self.best_score
         else:
             valid_stats = None
 
@@ -198,6 +198,7 @@ class AcceleratorTrainer:
                 torch.save(
                     {
                         "epoch": epoch,
+                        "best_score": self.best_score,
                         "args": self.args,
                         "model": unwrapped_model.state_dict(),
                     },
@@ -311,6 +312,7 @@ class AcceleratorTrainer:
                 stats = valid_stats
 
             is_best = self.is_best(stats)
+            valid_stats[f"best_{self.score_key}"] = self.best_score
             self.save(epoch=epoch, is_best=is_best)
             self.save_log(train_stats=train_stats, valid_stats=valid_stats, epoch=epoch)
             self.accelerator.wait_for_everyone()
