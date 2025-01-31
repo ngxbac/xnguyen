@@ -39,15 +39,34 @@ class AcceleratorTrainer:
         Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
 
     def setup_metric_comparision(self, score_key, compare_fn="increase"):
-        assert compare_fn in ["increase", "decrease"]
-        if compare_fn == "increase":
-            self.best_score = -np.inf
-            self.compare_fn = lambda x1, x2: x1 > x2
-        else:
-            self.best_score = np.inf
-            self.compare_fn = lambda x1, x2: x1 < x2
+        if not (isinstance(score_key, list) and isinstance(compare_fn, list)):
+            score_key = [score_key]
+            compare_fn = [compare_fn]
 
-        self.score_key = score_key
+        metric_comp_dict = {}
+        for score_key_, compare_fn_ in zip(score_key, compare_fn):
+            metric_comp_dict_ = self._setup_metric_comparision(
+                score_key=score_key_, compare_fn=compare_fn_
+            )
+            metric_comp_dict.update(metric_comp_dict_)
+
+        self.metric_comp_dict = metric_comp_dict
+
+    def _setup_metric_comparision(self, score_key, compare_fn="increase"):
+        assert compare_fn in ["increase", "decrease"]
+        metric_comp_dict = {}
+        metric_comp_dict[score_key] = {}
+        if compare_fn == "increase":
+            best_score = -np.inf
+            compare_fn = lambda x1, x2: x1 > x2
+        else:
+            best_score = np.inf
+            compare_fn = lambda x1, x2: x1 < x2
+
+        metric_comp_dict[score_key]["best_score"] = best_score
+        metric_comp_dict[score_key]["compare_fn"] = compare_fn
+        metric_comp_dict[score_key]["is_best"] = False
+        return metric_comp_dict
 
     def init_accelerator(self):
         from accelerate import Accelerator
@@ -177,19 +196,38 @@ class AcceleratorTrainer:
         train_stats = self.run_one_epoch(self.train_loader, epoch, is_train=True)
         return train_stats
 
-    def is_best(self, stats):
-        if stats is None:
-            return False
-
-        current_score = stats[self.score_key]
+    def _is_best(self, stats, score_key, best_score, compare_fn):
+        current_score = stats[score_key]
         is_best = False
-        if self.compare_fn(current_score, self.best_score):
-            self.best_score = current_score
+        if compare_fn(current_score, best_score):
+            best_score = current_score
             is_best = True
 
-        return is_best
+        return is_best, best_score
 
-    def save_ckpt(self, tag, epoch):
+    def check_best_score(self, stats):
+        if stats is None:
+            return stats
+
+        for score_key in self.metric_comp_dict.keys():
+            is_best, new_best_score = self._is_best(
+                stats=stats,
+                score_key=score_key,
+                best_score=self.metric_comp_dict[score_key]["best_score"],
+                compare_fn=self.metric_comp_dict[score_key]["compare_fn"],
+            )
+
+            self.metric_comp_dict[score_key]["is_best"] = is_best
+            if is_best:
+                self.metric_comp_dict[score_key]["best_score"] = new_best_score
+                stats[f"best_{score_key}"] = new_best_score
+            else:
+                stats[f"best_{score_key}"] = self.metric_comp_dict[score_key][
+                    "best_score"
+                ]
+        return stats
+
+    def save_ckpt(self, tag, epoch, best_score=None):
         if self.accelerator.is_main_process:
             ckpt_path = self.args.output_dir + f"/{tag}.pth"
             unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -198,7 +236,7 @@ class AcceleratorTrainer:
                 torch.save(
                     {
                         "epoch": epoch,
-                        "best_score": self.best_score,
+                        "best_score": best_score,
                         "args": self.args,
                         "model": unwrapped_model.state_dict(),
                     },
@@ -211,10 +249,14 @@ class AcceleratorTrainer:
         state_path = os.path.join(self.args.output_dir, tag)
         self.accelerator.save_state(state_path)
 
-    def save(self, epoch, is_best):
-        self.save_ckpt(f"last", epoch)
-        if is_best:
-            self.save_ckpt(f"best", epoch)
+    def save(self, epoch):
+        for score_key in self.metric_comp_dict.keys():
+            if self.metric_comp_dict[score_key]["is_best"]:
+                best_score = self.metric_comp_dict[score_key]["best_score"]
+                print(
+                    f"Saving best {score_key} at epoch ({epoch}) with score: {best_score}"
+                )
+                self.save_ckpt(f"best_{score_key}", epoch, best_score)
 
     def save_log(self, train_stats, valid_stats, epoch):
         def write_log(log_stats):
@@ -282,7 +324,7 @@ class AcceleratorTrainer:
 
     def train(self):
         start_time = time.time()
-        to_restore = {"epoch": 0, "best_score": self.best_score}
+        to_restore = {"epoch": 0}
         if os.path.isfile(self.args.resume):
             self.restart_from_checkpoint(
                 self.args.resume,
@@ -293,7 +335,7 @@ class AcceleratorTrainer:
             )
 
         start_epoch = to_restore["epoch"]
-        self.best_score = to_restore["best_score"]
+        # self.best_score = to_restore["best_score"]
 
         print(f"[+] Start training !")
         for epoch in range(start_epoch, self.args.epochs):
@@ -311,9 +353,8 @@ class AcceleratorTrainer:
             else:
                 stats = valid_stats
 
-            is_best = self.is_best(stats)
-            valid_stats[f"best_{self.score_key}"] = self.best_score
-            self.save(epoch=epoch, is_best=is_best)
+            self.check_best_score(stats)
+            self.save(epoch=epoch)
             self.save_log(train_stats=train_stats, valid_stats=valid_stats, epoch=epoch)
             self.accelerator.wait_for_everyone()
 
