@@ -227,10 +227,16 @@ class AcceleratorTrainer:
                 ]
         return stats
 
+    def get_model_state_dict(self):
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        state_dict = unwrapped_model.state_dict()
+        del unwrapped_model
+        return state_dict
+
     def save_ckpt(self, tag, epoch, best_score=None):
         if self.accelerator.is_main_process:
             ckpt_path = self.args.output_dir + f"/{tag}.pth"
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            state_dict = self.get_model_state_dict()
 
             try:
                 torch.save(
@@ -238,13 +244,12 @@ class AcceleratorTrainer:
                         "epoch": epoch,
                         "best_score": best_score,
                         "args": self.args,
-                        "model": unwrapped_model.state_dict(),
+                        "model": state_dict,
                     },
                     ckpt_path,
                 )
             except:
                 print("Couldn't save... moving on to prevent crashing.")
-            del unwrapped_model
 
         state_path = os.path.join(self.args.output_dir, tag)
         self.accelerator.save_state(state_path)
@@ -363,13 +368,14 @@ class AcceleratorTrainer:
         print("Training time {}".format(total_time_str))
 
     def model_forward(self, batch, is_train=True):
-        if not is_train:
-            with torch.no_grad():
+        with torch.cuda.amp.autocast():
+            if not is_train:
+                with torch.no_grad():
+                    loss = self.model(batch)
+            else:
                 loss = self.model(batch)
-        else:
-            loss = self.model(batch)
 
-        return loss
+            return loss
 
     def pre_forward(self, batch):
         for k, v in batch.items():
