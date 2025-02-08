@@ -255,6 +255,7 @@ class AcceleratorTrainer:
         self.accelerator.save_state(state_path)
 
     def save(self, epoch):
+        self.save_ckpt("last", epoch, None)
         for score_key in self.metric_comp_dict.keys():
             if self.metric_comp_dict[score_key]["is_best"]:
                 best_score = self.metric_comp_dict[score_key]["best_score"]
