@@ -233,8 +233,20 @@ class AcceleratorTrainer:
         del unwrapped_model
         return state_dict
 
+    def save_hf_model(self, tag):
+        try:
+            from diffusers.models.modeling_utils import ModelMixin
+            from diffusers.configuration_utils import ConfigMixin
+
+            if isinstance(self.model, ModelMixin):
+                save_dir = os.path.join(self.args.output_dir, "hf")
+                self.model.save_pretrained(f"{save_dir}/{tag}/")
+        except:
+            return
+
     def save_ckpt(self, tag, epoch, best_score=None):
         if self.accelerator.is_main_process:
+            self.save_hf_model(tag)
             ckpt_path = self.args.output_dir + f"/{tag}.pth"
             state_dict = self.get_model_state_dict()
 
