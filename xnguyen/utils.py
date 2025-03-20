@@ -236,3 +236,16 @@ def topk(similarities, labels, k=5):
             torch.argsort(similarities, axis=1)[:, -(i + 1)] == labels
         ) / len(labels)
     return topsum
+
+
+def load_pretrained(model, pretrained_path):
+    checkpoint = torch.load(pretrained_path, map_location="cpu")
+    checkpoint = checkpoint["model"] if "model" in checkpoint else checkpoint
+
+    new_state_dict = {}
+    for k, v in checkpoint.items():
+        kk = k.replace(".module", "")
+        new_state_dict[kk] = v
+
+    model.load_state_dict(new_state_dict)
+    return model

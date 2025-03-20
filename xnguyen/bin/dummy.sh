@@ -28,7 +28,7 @@ else # submit more than one cluster
   export CURRENT_RANK=$((SLURM_PROCID + OFFSET_RANK))
 fi
 
-export MASTER_PORT=2010
+export MASTER_PORT=2106
 export INIT_METHOD="tcp://${MASTER_ADDR}:${MASTER_PORT}"
 
 

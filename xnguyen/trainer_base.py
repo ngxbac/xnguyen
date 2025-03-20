@@ -38,6 +38,17 @@ class AcceleratorTrainer:
 
         Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
 
+    def __del__(self):
+        torch.cuda.empty_cache()
+        if hasattr(self, "accelerator"):
+            self.accelerator.free_memory()
+
+        if hasattr(self, "model"):
+            del self.model
+
+        if hasattr(self, "optimizer"):
+            del self.optimizer
+
     def setup_metric_comparision(self, score_key, compare_fn="increase"):
         if not (isinstance(score_key, list) and isinstance(compare_fn, list)):
             score_key = [score_key]
@@ -117,8 +128,8 @@ class AcceleratorTrainer:
         def print(*args, **kwargs):
             force = kwargs.pop("force", False)
             if is_master:  # or force:
-                now = datetime.datetime.now().time()
-                builtin_print("[{}] ".format(now), end="")  # print with time stamp
+                # now = datetime.datetime.now().time()
+                # builtin_print("[{}] ".format(now), end="")  # print with time stamp
                 builtin_print(*args, **kwargs)
 
         builtins.print = print
