@@ -239,7 +239,7 @@ def topk(similarities, labels, k=5):
 
 
 def load_pretrained(model, pretrained_path):
-    checkpoint = torch.load(pretrained_path, map_location="cpu")
+    checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=False)
     checkpoint = checkpoint["model"] if "model" in checkpoint else checkpoint
 
     new_state_dict = {}
