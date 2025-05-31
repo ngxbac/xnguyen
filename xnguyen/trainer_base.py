@@ -114,6 +114,7 @@ class AcceleratorTrainer:
 
         self.args.distributed = distributed
         self.setup_for_distributed(accelerator.is_main_process)
+        torch.cuda.set_device(local_rank)  # important for proper GPU assignment
 
         return accelerator
 
