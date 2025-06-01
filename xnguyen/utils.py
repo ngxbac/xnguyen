@@ -242,10 +242,19 @@ def load_pretrained(model, pretrained_path):
     checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=False)
     checkpoint = checkpoint["model"] if "model" in checkpoint else checkpoint
 
+    # Clean up keys: remove .module prefix
     new_state_dict = {}
     for k, v in checkpoint.items():
-        kk = k.replace(".module", "")
+        kk = k.replace(".module", "")  # in case checkpoint was saved from DDP
         new_state_dict[kk] = v
 
-    model.load_state_dict(new_state_dict)
+    # Load into model or model.module if using DDP
+    target_model = model.module if hasattr(model, "module") else model
+    missing, unexpected = target_model.load_state_dict(new_state_dict, strict=False)
+
+    if missing:
+        print(f"[Warning] Missing keys: {missing}")
+    if unexpected:
+        print(f"[Warning] Unexpected keys: {unexpected}")
+
     return model
