@@ -520,7 +520,10 @@ class AcceleratorTrainer:
                 batch[k] = batch[k].cuda()
         return batch
 
-    def pos_forward(self, loss, is_train=True):
+    def pos_forward(self, batch, otput_dict):
+        return batch, output_dict
+
+    def backprobagation(self, loss, is_train=True):
         if not math.isfinite(loss.item()):
             self.accelerator.print(
                 f"Loss is {loss.item()}, stopping training", force=True
@@ -555,8 +558,9 @@ class AcceleratorTrainer:
 
             batch = self.pre_forward(batch)
             output_dict = self.model_forward(batch=batch, is_train=is_train)
+            batch, output_dict = self.pos_forward(batch=batch, output_dict=output_dict)
             ret_dict = self.criterion(output_dict, batch)
-            self.pos_forward(loss=ret_dict["loss"], is_train=is_train)
+            self.backprobagation(loss=ret_dict["loss"], is_train=is_train)
 
             if self.args.distributed:
                 torch.cuda.synchronize()
