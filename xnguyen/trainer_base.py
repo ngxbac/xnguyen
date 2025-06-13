@@ -7,8 +7,7 @@ import sys
 import time
 import json
 from pathlib import Path
-from collections import defaultdict, deque
-from typing import List, Optional
+from typing import List
 from abc import ABC, abstractmethod
 import torch.nn as nn
 
@@ -16,15 +15,14 @@ from xnguyen.scheduler import OneCycleLRWithWarmup
 import torch.distributed as dist
 from xnguyen.utils import MetricLogger
 
-
 from accelerate import Accelerator, DeepSpeedPlugin
+from timm.utils import ModelEmaV3
 
 
 class AcceleratorTrainer:
     def __init__(self, args):
         self.args = args
         self.accelerator = self.init_accelerator()
-        # self.scale_lr()
         self.pre_init()
         self.train_loader, self.valid_loader = self.get_dataloader()
         self.model = self.get_model()
@@ -32,24 +30,54 @@ class AcceleratorTrainer:
         self.scheduler = self.get_scheduler()
         self.criterion = self.get_criterion()
 
-        self.prepare_multi_gpu()
+        self.accumulation_steps = getattr(self.args, "gradient_accumulation_steps", 1)
 
-        self.setup_metric_comparision(score_key="loss", compare_fn="decrease")
+        self.prepare_multi_gpu()
+        # self.setup_metric_comparision(score_key="loss", compare_fn="decrease")
 
         Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
 
+        # EMA support
+        self.ema_decay = getattr(self.args, "ema_decay", None)
+        self.ema_model = None
+        if self.ema_decay is not None:
+            print(f"[EMA] Initializing ModelEmaV2 with decay = {self.ema_decay}")
+            self.ema_model = ModelEmaV3(
+                self.model,
+                decay=self.ema_decay,
+                device="cpu" if getattr(self.args, "ema_on_cpu", False) else None,
+            )
+
+        # Early stopping
+        self.early_stopping_patience = getattr(
+            self.args, "early_stopping_patience", None
+        )
+        self.early_stopping_counter = 0
+
+        # Setup metric dicts for regular model and EMA model
+        self.setup_metric_comparision(score_key="loss", compare_fn="decrease")
+
     def __del__(self):
-        torch.cuda.empty_cache()
-        if hasattr(self, "accelerator"):
-            self.accelerator.free_memory()
-
-        if hasattr(self, "model"):
-            del self.model
-
-        if hasattr(self, "optimizer"):
-            del self.optimizer
+        try:
+            torch.cuda.empty_cache()
+            if hasattr(self, "accelerator"):
+                try:
+                    self.accelerator.free_memory()
+                except Exception as e:
+                    print(f"[WARNING] Error calling accelerator.free_memory(): {e}")
+            if hasattr(self, "model"):
+                del self.model
+            if hasattr(self, "optimizer"):
+                del self.optimizer
+        except:
+            pass
 
     def setup_metric_comparision(self, score_key, compare_fn="increase"):
+        # Always store current score key and compare fn
+        self._current_score_key = score_key
+        self._current_compare_fn = compare_fn
+
+        # Build regular metric dict
         if not (isinstance(score_key, list) and isinstance(compare_fn, list)):
             score_key = [score_key]
             compare_fn = [compare_fn]
@@ -61,7 +89,19 @@ class AcceleratorTrainer:
             )
             metric_comp_dict.update(metric_comp_dict_)
 
+        # Update model metric dict
         self.metric_comp_dict = metric_comp_dict
+        self.metric_comp_dict_model = metric_comp_dict.copy()
+
+        # If EMA is enabled → update its metric dict too
+        if self.ema_model is not None:
+            metric_comp_dict_ema = {}
+            for score_key_, compare_fn_ in zip(score_key, compare_fn):
+                metric_comp_dict_ema_ = self._setup_metric_comparision(
+                    score_key=score_key_, compare_fn=compare_fn_
+                )
+                metric_comp_dict_ema.update(metric_comp_dict_ema_)
+            self.metric_comp_dict_ema = metric_comp_dict_ema
 
     def _setup_metric_comparision(self, score_key, compare_fn="increase"):
         assert compare_fn in ["increase", "decrease"]
@@ -80,7 +120,6 @@ class AcceleratorTrainer:
         return metric_comp_dict
 
     def init_accelerator(self):
-        from accelerate import Accelerator
         from accelerate.utils import DistributedDataParallelKwargs
 
         kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -114,23 +153,18 @@ class AcceleratorTrainer:
 
         self.args.distributed = distributed
         self.setup_for_distributed(accelerator.is_main_process)
-        torch.cuda.set_device(local_rank)  # important for proper GPU assignment
+        torch.cuda.set_device(local_rank)
 
         return accelerator
 
     def setup_for_distributed(self, is_master):
-        """
-        This function disables printing when not in master process
-        """
         import builtins
 
         builtin_print = builtins.print
 
         def print(*args, **kwargs):
             force = kwargs.pop("force", False)
-            if is_master:  # or force:
-                # now = datetime.datetime.now().time()
-                # builtin_print("[{}] ".format(now), end="")  # print with time stamp
+            if is_master or force:
                 builtin_print(*args, **kwargs)
 
         builtins.print = print
@@ -151,8 +185,6 @@ class AcceleratorTrainer:
         )
 
     def scale_lr(self):
-        # num_process = int(os.environ["WORLD_SIZE"])
-        # self.args.lr *= (self.args.batch_size * num_process) / 256.0
         self.args.lr *= self.accelerator.num_processes
 
     def get_dataloader(self):
@@ -173,11 +205,9 @@ class AcceleratorTrainer:
             lr=self.args.lr,
             weight_decay=self.args.weight_decay,
         )
-
         return optimizer
 
     def get_scheduler(self):
-        # prepare lr scheduler
         one_epoch_steps = len(self.train_loader)
         total_steps = self.args.epochs * one_epoch_steps
         print("one_epoch_steps_per_gpu:", one_epoch_steps)
@@ -190,17 +220,29 @@ class AcceleratorTrainer:
             last_epoch=-1,
             pct_start=2 / self.args.epochs,
         )
-
         return scheduler
 
     def valid_one_epoch(self, epoch):
-        if self.valid_loader and (epoch + 1) % self.args.eval_interval == 0:
-            valid_stats = self.run_one_epoch(self.valid_loader, epoch, is_train=False)
-            # valid_stats[f"best_{self.score_key}"] = self.best_score
-        else:
-            valid_stats = None
+        valid_stats_model = None
+        valid_stats_ema = None
 
-        return valid_stats
+        if self.valid_loader and (epoch + 1) % self.args.eval_interval == 0:
+            # Validate regular model
+            valid_stats_model = self.run_one_epoch(
+                self.valid_loader, epoch, is_train=False
+            )
+
+            # Validate EMA model
+            if self.ema_model is not None:
+                print("[EMA] Validating EMA model")
+                orig_model = self.model
+                self.model = self.ema_model.module
+                valid_stats_ema = self.run_one_epoch(
+                    self.valid_loader, epoch, is_train=False
+                )
+                self.model = orig_model
+
+        return valid_stats_model, valid_stats_ema
 
     def train_one_epoch(self, epoch):
         if self.args.distributed:
@@ -214,13 +256,11 @@ class AcceleratorTrainer:
         if compare_fn(current_score, best_score):
             best_score = current_score
             is_best = True
-
         return is_best, best_score
 
     def check_best_score(self, stats):
         if stats is None:
             return stats
-
         for score_key in self.metric_comp_dict.keys():
             is_best, new_best_score = self._is_best(
                 stats=stats,
@@ -228,15 +268,10 @@ class AcceleratorTrainer:
                 best_score=self.metric_comp_dict[score_key]["best_score"],
                 compare_fn=self.metric_comp_dict[score_key]["compare_fn"],
             )
-
             self.metric_comp_dict[score_key]["is_best"] = is_best
             if is_best:
                 self.metric_comp_dict[score_key]["best_score"] = new_best_score
-                stats[f"best_{score_key}"] = new_best_score
-            else:
-                stats[f"best_{score_key}"] = self.metric_comp_dict[score_key][
-                    "best_score"
-                ]
+            stats[f"best_{score_key}"] = self.metric_comp_dict[score_key]["best_score"]
         return stats
 
     def get_model_state_dict(self):
@@ -248,7 +283,6 @@ class AcceleratorTrainer:
     def save_hf_model(self, tag):
         try:
             from diffusers.models.modeling_utils import ModelMixin
-            from diffusers.configuration_utils import ConfigMixin
 
             if isinstance(self.model, ModelMixin):
                 save_dir = os.path.join(self.args.output_dir, "hf")
@@ -256,37 +290,89 @@ class AcceleratorTrainer:
         except:
             return
 
-    def save_ckpt(self, tag, epoch, best_score=None):
+    def save_ckpt(self, tag, epoch, best_score=None, save_model=True, save_ema=True):
         if self.accelerator.is_main_process:
-            self.save_hf_model(tag)
-            ckpt_path = self.args.output_dir + f"/{tag}.pth"
-            state_dict = self.get_model_state_dict()
+            # Save regular model
+            if save_model:
+                self.save_hf_model(tag)
+                ckpt_path = os.path.join(self.args.output_dir, f"{tag}.pth")
+                state_dict = self.get_model_state_dict()
+                try:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "best_score": best_score,
+                            "args": self.args,
+                            "model": state_dict,
+                        },
+                        ckpt_path,
+                    )
+                    print(f"[SAVE] Model checkpoint saved to {ckpt_path}")
+                except Exception as e:
+                    print(
+                        f"[SAVE WARNING] Could not save model checkpoint to {ckpt_path}: {e}"
+                    )
 
+            # Save EMA model
+            if save_ema and self.ema_model is not None:
+                ema_ckpt_path = os.path.join(self.args.output_dir, f"{tag}_ema.pth")
+                try:
+                    ema_state_dict = self.ema_model.module.state_dict()
+                    torch.save(ema_state_dict, ema_ckpt_path)
+                    print(f"[SAVE] EMA checkpoint saved to {ema_ckpt_path}")
+                except Exception as e:
+                    print(
+                        f"[SAVE WARNING] Could not save EMA checkpoint to {ema_ckpt_path}: {e}"
+                    )
+
+            # Save full accelerator state
+            state_path = os.path.join(self.args.output_dir, tag)
             try:
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "best_score": best_score,
-                        "args": self.args,
-                        "model": state_dict,
-                    },
-                    ckpt_path,
+                self.accelerator.save_state(state_path)
+                print(f"[SAVE] Accelerator state saved to {state_path}")
+            except Exception as e:
+                print(
+                    f"[SAVE WARNING] Could not save Accelerator state to {state_path}: {e}"
                 )
-            except:
-                print("Couldn't save... moving on to prevent crashing.")
 
-        state_path = os.path.join(self.args.output_dir, tag)
-        self.accelerator.save_state(state_path)
+        self.accelerator.wait_for_everyone()
 
     def save(self, epoch):
-        self.save_ckpt("last", epoch, None)
+        # Save last checkpoint for regular model
+        self.metric_comp_dict = self.metric_comp_dict_model
+        self.save_ckpt("last", epoch, None, save_model=True, save_ema=False)
+
+        # Save best regular model
         for score_key in self.metric_comp_dict.keys():
             if self.metric_comp_dict[score_key]["is_best"]:
                 best_score = self.metric_comp_dict[score_key]["best_score"]
                 print(
                     f"Saving best {score_key} at epoch ({epoch}) with score: {best_score}"
                 )
-                self.save_ckpt(f"best_{score_key}", epoch, best_score)
+                self.save_ckpt(
+                    f"best_{score_key}",
+                    epoch,
+                    best_score,
+                    save_model=True,
+                    save_ema=False,
+                )
+
+        # Save best EMA model
+        if self.ema_model is not None:
+            self.metric_comp_dict = self.metric_comp_dict_ema
+            for score_key in self.metric_comp_dict.keys():
+                if self.metric_comp_dict[score_key]["is_best"]:
+                    best_score = self.metric_comp_dict[score_key]["best_score"]
+                    print(
+                        f"[EMA] Saving best {score_key} at epoch ({epoch}) with score: {best_score}"
+                    )
+                    self.save_ckpt(
+                        f"best_{score_key}_ema",
+                        epoch,
+                        best_score,
+                        save_model=False,
+                        save_ema=True,
+                    )
 
     def save_log(self, train_stats, valid_stats, epoch):
         def write_log(log_stats):
@@ -298,7 +384,6 @@ class AcceleratorTrainer:
             **{f"train_{k}": v for k, v in train_stats.items()},
             "epoch": epoch,
         }
-
         write_log(log_train_stats)
 
         if valid_stats is not None:
@@ -309,48 +394,42 @@ class AcceleratorTrainer:
             write_log(log_valid_stats)
 
     def restart_from_checkpoint(self, ckp_path, run_variables=None, **kwargs):
-        """
-        Re-start from checkpoint
-        """
         if not os.path.isfile(ckp_path):
             return
         print("Found checkpoint at {}".format(ckp_path))
-
-        # open checkpoint file
         checkpoint = torch.load(ckp_path, map_location="cpu")
 
-        # key is what to look for in the checkpoint file
-        # value is the object to load
-        # example: {'state_dict': model}
         for key, value in kwargs.items():
             if key in checkpoint and value is not None:
                 try:
                     msg = value.load_state_dict(checkpoint[key], strict=True)
                     print(
-                        "=> loaded '{}' from checkpoint '{}' with msg {}".format(
-                            key, ckp_path, msg
-                        )
+                        f"=> loaded '{key}' from checkpoint '{ckp_path}' with msg {msg}"
                     )
                 except TypeError:
                     try:
                         msg = value.load_state_dict(checkpoint[key])
-                        print(
-                            "=> loaded '{}' from checkpoint: '{}'".format(key, ckp_path)
-                        )
+                        print(f"=> loaded '{key}' from checkpoint: '{ckp_path}'")
                     except ValueError:
                         print(
-                            "=> failed to load '{}' from checkpoint: '{}'".format(
-                                key, ckp_path
-                            )
+                            f"=> failed to load '{key}' from checkpoint: '{ckp_path}'"
                         )
             else:
-                print("=> key '{}' not found in checkpoint: '{}'".format(key, ckp_path))
+                print(f"=> key '{key}' not found in checkpoint: '{ckp_path}'")
 
-        # re load variable important for the run
         if run_variables is not None:
             for var_name in run_variables:
                 if var_name in checkpoint:
                     run_variables[var_name] = checkpoint[var_name]
+
+    # === NEW HOOKS ===
+    def before_train_epoch(self, epoch):
+        """Hook called before starting train_one_epoch"""
+        pass
+
+    def after_train_epoch(self, epoch, train_stats, valid_stats):
+        """Hook called after finishing one epoch (train+valid), before saving/checkpoint"""
+        pass
 
     def train(self):
         start_time = time.time()
@@ -365,71 +444,107 @@ class AcceleratorTrainer:
             )
 
         start_epoch = to_restore["epoch"]
-        # self.best_score = to_restore["best_score"]
-
         print(f"[+] Start training !")
         for epoch in range(start_epoch, self.args.epochs):
+            self.before_train_epoch(epoch)
+
             train_stats = self.train_one_epoch(epoch)
-            valid_stats = self.valid_one_epoch(epoch)
+            valid_stats_model, valid_stats_ema = self.valid_one_epoch(epoch)
 
-            if valid_stats is None:
-                valid_stats = train_stats
-                stats = train_stats
-            else:
-                stats = valid_stats
+            # Choose stats for early stopping (based on regular model)
+            stats_for_early_stopping = (
+                valid_stats_model if valid_stats_model is not None else train_stats
+            )
 
-            if self.valid_loader is None:  # No valid steps
-                stats = train_stats
-            else:
-                stats = valid_stats
+            # Check best REGULAR model
+            self.metric_comp_dict = self.metric_comp_dict_model
+            self.check_best_score(stats_for_early_stopping)
 
-            self.check_best_score(stats)
+            # Check best EMA model
+            if self.ema_model is not None and valid_stats_ema is not None:
+                self.metric_comp_dict = self.metric_comp_dict_ema
+                self.check_best_score(valid_stats_ema)
+
+            # Save checkpoints
             self.save(epoch=epoch)
-            self.save_log(train_stats=train_stats, valid_stats=valid_stats, epoch=epoch)
-            self.accelerator.wait_for_everyone()
+
+            # Save logs
+            self.save_log(
+                train_stats=train_stats, valid_stats=valid_stats_model, epoch=epoch
+            )
+            if valid_stats_ema is not None:
+                # Optionally you can suffix EMA keys here if you want
+                self.save_log(
+                    train_stats=train_stats, valid_stats=valid_stats_ema, epoch=epoch
+                )
+
+            # Early stopping based on regular model
+            improved = any(
+                [
+                    self.metric_comp_dict_model[k]["is_best"]
+                    for k in self.metric_comp_dict_model.keys()
+                ]
+            )
+
+            if improved:
+                self.early_stopping_counter = 0
+            else:
+                self.early_stopping_counter += 1
+
+            if self.early_stopping_patience is not None:
+                print(
+                    f"[EARLY STOPPING] Counter = {self.early_stopping_counter} / {self.early_stopping_patience}"
+                )
+                if self.early_stopping_counter >= self.early_stopping_patience:
+                    print(
+                        f"[EARLY STOPPING] No improvement for {self.early_stopping_counter} epochs. Stopping training."
+                    )
+                    break
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print("Training time {}".format(total_time_str))
 
     def model_forward(self, batch, is_train=True):
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type="cuda", enabled=self.args.use_fp16):
             if not is_train:
                 with torch.no_grad():
-                    loss = self.model(batch)
+                    output_dict = self.model(batch)
             else:
-                loss = self.model(batch)
-
-            return loss
+                output_dict = self.model(batch)
+            return output_dict
 
     def pre_forward(self, batch):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = batch[k].cuda()
-
         return batch
 
     def pos_forward(self, loss, is_train=True):
         if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
+            self.accelerator.print(
+                f"Loss is {loss.item()}, stopping training", force=True
+            )
             sys.exit(1)
 
         if not is_train:
             return
 
         self.accelerator.backward(loss)
-        self.optimizer.step()
-        self.scheduler.step()
-        # self.optimizer.zero_grad()
+
+        if (getattr(self, "epoch_step", 0) + 1) % self.accumulation_steps == 0:
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+
+            if self.ema_model is not None:
+                self.ema_model.update(self.model)
 
     def run_one_epoch(self, data_loader, epoch, is_train):
         self.epoch = epoch
-        if is_train:
-            self.model.train()
-            prefix = "TRAIN"
-        else:
-            self.model.eval()
-            prefix = "VALID"
+        self.epoch_step = 0
+        self.model.train() if is_train else self.model.eval()
+        prefix = "TRAIN" if is_train else "VALID"
 
         metric_logger = MetricLogger(delimiter="  ")
         header = "Epoch: [{}/{}]".format(epoch, self.args.epochs)
@@ -437,12 +552,12 @@ class AcceleratorTrainer:
         for batch in metric_logger.log_every(data_loader, 10, header):
             if is_train:
                 self.optimizer.zero_grad()
+
             batch = self.pre_forward(batch)
             output_dict = self.model_forward(batch=batch, is_train=is_train)
             ret_dict = self.criterion(output_dict, batch)
             self.pos_forward(loss=ret_dict["loss"], is_train=is_train)
 
-            # logging
             if self.args.distributed:
                 torch.cuda.synchronize()
 
@@ -452,8 +567,10 @@ class AcceleratorTrainer:
             metric_logger.update(lr=self.optimizer.param_groups[0]["lr"])
             metric_logger.update(wd=self.optimizer.param_groups[0]["weight_decay"])
 
-        # gather the stats from all processes
+            self.epoch_step += 1
+
         if self.args.distributed:
             metric_logger.synchronize_between_processes()
+
         print(f"[{prefix}] Averaged stats:", metric_logger)
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

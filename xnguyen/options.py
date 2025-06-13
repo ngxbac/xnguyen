@@ -54,6 +54,28 @@ parser.add_argument(
     type=int,
     help="Number of data loading workers per GPU.",
 )
+
+parser.add_argument(
+    "--ema-decay",
+    type=float,
+    default=0.9995,
+    help="EMA decay rate (e.g. 0.9995). If None, disables EMA.",
+)
+parser.add_argument(
+    "--ema-on-cpu",
+    action="store_true",
+    help="Store EMA model on CPU (saves GPU memory).",
+)
+parser.add_argument(
+    "--use-ema-eval", action="store_true", help="Use EMA model for validation."
+)
+parser.add_argument(
+    "--early-stopping-patience",
+    type=int,
+    default=None,
+    help="Early stopping patience. Stop training if no improvement after N epochs.",
+)
+
 parser.add_argument(
     "--distributed",
     # default=True,
@@ -79,5 +101,6 @@ parser.add_argument(
     type=int,
     help="Please ignore and do not set this argument.",
 )
+
 
 # args = parser.parse_args()
