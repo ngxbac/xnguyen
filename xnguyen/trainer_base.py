@@ -39,6 +39,7 @@ class AcceleratorTrainer:
 
         # EMA support
         self.ema_decay = getattr(self.args, "ema_decay", None)
+        self.use_ema_eval = getattr(self.args, "use_ema_eval", False)
         self.ema_model = None
         if self.ema_decay is not None:
             print(f"[EMA] Initializing ModelEmaV2 with decay = {self.ema_decay}")
@@ -233,7 +234,7 @@ class AcceleratorTrainer:
             )
 
             # Validate EMA model
-            if self.ema_model is not None:
+            if self.ema_model is not None and self.use_ema_eval:
                 print("[EMA] Validating EMA model")
                 orig_model = self.model
                 self.model = self.ema_model.module
