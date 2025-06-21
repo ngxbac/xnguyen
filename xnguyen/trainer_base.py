@@ -123,7 +123,10 @@ class AcceleratorTrainer:
     def init_accelerator(self):
         from accelerate.utils import DistributedDataParallelKwargs
 
-        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        find_unused_parameters = getattr(self.args, "find_unused_parameters", False)
+        kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=find_unused_parameters
+        )
         deepspeed_plugin = DeepSpeedPlugin(zero_stage=2, gradient_clipping=1.0)
         accelerator = Accelerator(
             split_batches=False,
