@@ -22,6 +22,12 @@ parser.add_argument(
     to use half precision for training""",
 )
 parser.add_argument(
+    "--find_unused_parameters",
+    # action=argparse.BooleanOptionalAction,
+    action="store_true",
+    default=False,
+)
+parser.add_argument(
     "--weight_decay",
     type=float,
     default=1e-4,

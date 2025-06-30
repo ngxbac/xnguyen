@@ -524,7 +524,7 @@ class AcceleratorTrainer:
                 batch[k] = batch[k].cuda()
         return batch
 
-    def pos_forward(self, batch, otput_dict):
+    def pos_forward(self, batch, output_dict):
         return batch, output_dict
 
     def backprobagation(self, loss, is_train=True):
