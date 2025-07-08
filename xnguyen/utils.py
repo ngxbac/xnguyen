@@ -238,6 +238,8 @@ def topk(similarities, labels, k=5):
     return topsum
 
 
+import torch
+
 def load_pretrained(model, pretrained_path):
     checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=False)
     checkpoint = checkpoint["model"] if "model" in checkpoint else checkpoint
@@ -245,16 +247,39 @@ def load_pretrained(model, pretrained_path):
     # Clean up keys: remove .module prefix
     new_state_dict = {}
     for k, v in checkpoint.items():
-        kk = k.replace(".module", "")  # in case checkpoint was saved from DDP
+        kk = k.replace(".module", "")  # handle DDP
         new_state_dict[kk] = v
 
-    # Load into model or model.module if using DDP
+    # Reference model parameters
     target_model = model.module if hasattr(model, "module") else model
-    missing, unexpected = target_model.load_state_dict(new_state_dict, strict=False)
+    model_state = target_model.state_dict()
 
+    # Filter for matching shape
+    compatible_state_dict = {}
+    mismatched_keys = []
+
+    for k, v in new_state_dict.items():
+        if k in model_state:
+            if v.shape == model_state[k].shape:
+                compatible_state_dict[k] = v
+            else:
+                mismatched_keys.append((k, v.shape, model_state[k].shape))
+        else:
+            # Still include; load_state_dict with strict=False will ignore unexpected
+            compatible_state_dict[k] = v
+
+    # Load filtered state dict
+    missing, unexpected = target_model.load_state_dict(compatible_state_dict, strict=False)
+
+    # Report
     if missing:
         print(f"[Warning] Missing keys: {missing}")
     if unexpected:
         print(f"[Warning] Unexpected keys: {unexpected}")
+    if mismatched_keys:
+        print("[Warning] Mismatched keys:")
+        for k, ckpt_shape, model_shape in mismatched_keys:
+            print(f" - {k}: checkpoint shape {ckpt_shape}, model shape {model_shape}")
 
     return model
+
